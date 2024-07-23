@@ -45,6 +45,7 @@ for op in op_names:
 
 # Builtin python imports (continued)
 import argparse
+import itertools
 import json
 import pathlib
 import re
@@ -63,6 +64,9 @@ OLLAMA_CONFIGS = []
 # At some point, this tokenizer needs to become pickable - but for now we'll
 # always assume that a GPT2 tokenizer is appropriate
 tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+# Make a vocab of numbers one time
+number_vocab = np.array(sorted(set([int(_) for _ in tokenizer.vocab.keys()\
+                                    if re.match(r"-?\d+", _)])))
 
 def bitshift_list(i_value, max_bits=None):
     if max_bits is None:
@@ -162,10 +166,83 @@ def show_last_results(results: List[int]) -> None:
     """
     print(" | ".join([f"{k}: {bitshift_list(results[k][-1])}" for k in results]))
 
+def generate_operands(n_to_create: int,
+                      max_digits: int,
+                      strict: bool,
+                      include_negative: bool,
+                      in_vocab: Optional[bool] = None) -> np.ndarray:
+    """
+        Create a number of operands with specified digit range and
+        characteristics, including respect to token vocabulary
+
+        `n_to_create`: Number of operands to create and return
+        `max_digits`: Operand values will not exceed this number of base-10
+                      digit lengths
+        `strict`: When true, ALL operands will be maximum length; when false,
+                  operands will be strictly lte maximum length
+        `include_negative`: When true, operands may be negative-valued; when
+                            false operands will be strictly non-negative
+        `in_vocab`: When non-None, guarantee that operands are(n't) in the token
+                    vocabulary based on the truthiness of this value
+    """
+    min_value = 0 if not strict else 10**(max_digits-1)
+    max_value = 10**max_digits
+    n_possible = (max_value - min_value) * (2 if include_negative else 1)
+    if in_vocab is None:
+        # Straightforward to select valid values via randint
+        operands = np.random.randint(min_value, max_value, n_to_create)
+        if include_negative:
+            operands[np.where(np.random.rand(n_to_create) < 0.5)[0]] *= -1
+    else:
+        # Start with non-negative set
+        gte_min = np.where(number_vocab >= min_value)[0]
+        lt_max = np.where(number_vocab < max_value)[0]
+        tokens_in_range = number_vocab[np.intersect1d(gte_min,lt_max,
+                                                      assume_unique=True)]
+        if include_negative:
+            # Generally I expect negative values to not be individual tokens,
+            # but check anyways
+            gte_min = np.where(number_vocab <= -1*min_value)[0]
+            lt_max = np.where(number_vocab > -1*max_value)[0]
+            negative_range = number_vocab[np.intersect1d(gte_min,lt_max,
+                                                         assume_unique=True)]
+            # If empty it will upcast to float, which messes up hstack's type
+            # as well
+            negative_range = negative_range.astype(int)
+            tokens_in_range = np.hstack((negative_range,tokens_in_range))
+        if in_vocab:
+            operands = np.random.choice(token_in_range, size=n_to_create)
+        else:
+            # Determine power and representations for best sampling strategy
+            tokened = len(tokens_in_range) / n_possible
+            if tokened == 1.0:
+                # It's not possible to sample out-of-vocabulary for this setup
+                raise ValueError(f"All {max_digit}-digit integers are in-token "
+                                 f"vocabulary")
+            elif tokened >= 0.2:
+                # Rejection sampling would possibly be bad, and this list
+                # should end up being short enough to not worry too much
+                possible = set(range(min_value,max_value))
+                if include_negative:
+                    possible.add(set(range(-max_value,-min_value)))
+                possible = sorted(possible.difference(set(tokens_in_range)))
+                operands = np.random.choice(possible, size=n_to_create)
+            else:
+                # Rejection sampling should need a minimal number of trials
+                selections = []
+                while len(selections) < n_to_create:
+                    picked = np.random.randint(min_value,max_value, n_to_create)
+                    if include_negative:
+                        picked[np.where(np.random.rand(n_to_create) < 0.5)[0]] *= -1
+                    picked = [_ for _ in picked if _ not in tokens_in_range]
+                    selections.extend(picked)
+                operands = selections[:n_to_create]
+    return operands
+
 def llm_examples(op: callable,
                  tqdm_updater: tqdm.tqdm = None,
                  n_examples: Union[int,float] = 10,
-                 context_length: Optional[int] = None,
+                 token_limit: Optional[int] = None,
                  n_evals: int = 10,
                  max_digits: int = 2,
                  strict_digits: bool = False,
@@ -176,6 +253,8 @@ def llm_examples(op: callable,
                  feature_expression: bool = False,
                  substitution_operand: Union[None,Tuple[str,str]] = None,
                  encourage_rewrites: bool = False,
+                 icl_in_vocab: Optional[bool] = None,
+                 eval_in_vocab: Optional[bool] = None,
                  ) -> Dict[str, Dict[str, int]]:
     """
         Main driver function of the test battery this script intends to provide.
@@ -188,12 +267,13 @@ def llm_examples(op: callable,
             }
 
         `op`: The callable function to utilize for these tests
-        `tqdm_updater`: tqdm.tqdm object to update once per LLM generation-and-parse
+        `tqdm_updater`: tqdm.tqdm object to update once per LLM generation-and-
+                        parse
         `n_examples`: The number of examples to provide for ICL to the LLM,
                       if this value is a floating-point type, then tokens are
                       generated until an example would exceed this proprotion
                       of the model's context length
-        `context_length`: The number of tokens that fit the model's context
+        `token_limit`: The number of tokens that fit the model's context
         `n_evals`: The number of different expressions given to the LLM for
                    evaluating across different inputs. NOTE that the LLM will
                    use each configuration PER eval, so the total number of LLM
@@ -230,12 +310,16 @@ def llm_examples(op: callable,
                               benefit the LLM by permitting its memorization
                               to work more effectively than a completely
                               context-based symbol substitution.
+        `icl_in_vocab`: Prefer operands to be (in/out of) vocabulary single
+                        tokens (unless None, wherein no preference) for ICL
+        `eval_in_vocab`: Prefer operands to be (in/out of) vocabulary single
+                         tokens (unless None, wherein no preference) for evaluations
     """
     # ENSURE RANDOM GENERATIONS ARE CONSISTENT ACROSS REPEATED PROGRAM
     # INVOKATIONS
     np.random.seed(1)
     token_expenditure = 0
-    count_tokens = context_length is not None and isinstance(n_examples, float)
+    count_tokens = token_limit is not None and isinstance(n_examples, float)
 
     ###########################################################################
     #                                                                         #
@@ -296,14 +380,10 @@ def llm_examples(op: callable,
     #                                                                         #
     ###########################################################################
 
-    # Acceptable absolute range of numbers to use as operands
-    operand_range = (10**(max_digits-1) if strict_digits else 0,
-                     10**max_digits)
     # Challenges for the LLM to solve are generated and converted into natural
     # language prompts based on desired settings
-    prompt_operands = np.random.randint(*operand_range, n_evals*2)
-    if include_negative:
-        prompt_operands[np.random.rand(n_evals*2) < 0.5] *= -1
+    prompt_operands = generate_operands(n_evals*2, max_digits, strict_digits,
+                                        include_negative, in_vocab=eval_in_vocab)
     prompt_queue = natural_language_math(prompt_operands,
                         op,
                         with_answer=False, # Challenges never include answer
@@ -339,17 +419,15 @@ def llm_examples(op: callable,
                   f"tokens, running total: {token_expenditure}")
     while (with_context or use_both) and \
           (count_tokens or (len(icl_queue) < n_examples)):
-        icl_operands = np.random.randint(*operand_range, 2)
-        # If including negatives, let about half of them end up being negative
-        if include_negative:
-            icl_operands[np.random.rand(2) < 0.5] *= -1
+        icl_operands = generate_operands(2, max_digits, strict_digits,
+                                         include_negative, in_vocab=icl_in_vocab)
         icl = natural_language_math(icl_operands,
                                     op,
                                     with_answer=True, # ICL always includes answer
                                     feature_expression=feature_expression)
         if count_tokens:
             new_prompt_len = tokenize(icl, count=True)
-            if token_expenditure + new_prompt_len >= context_length:
+            if token_expenditure + new_prompt_len >= token_limit:
                 break
             token_expenditure += new_prompt_len
             print(f"ICL prompt {len(icl_queue)+1} adds {new_prompt_len} tokens, "
@@ -373,7 +451,7 @@ def llm_examples(op: callable,
     print("Basic prompt without query:")
     print("".join([_['content'] for _ in initial_mstate]))
     if count_tokens:
-        print(f"Counted tokens: {token_expenditure} / {context_length}")
+        print(f"Counted tokens: {token_expenditure} / {token_limit}")
         post_hoc = tokenize(initial_mstate+[prompt_queue[longest_prompt]],
                             count=True)
         print(f"Post-hoc count: {post_hoc}")
@@ -614,6 +692,14 @@ if __name__ == '__main__':
     exconf.add_argument('--negatives', choices=['True','False'], nargs='+',
                      required=True,
                      help="Permit negative values")
+    exconf.add_argument('--icl-in-vocab', choices=['None','True','False'],
+                     nargs='*', default=None, help="Force in-context learning "
+                     "values to be (None=any | True=in | False=out-of) "
+                     "vocabulary")
+    exconf.add_argument('--eval-in-vocab', choices=['None','True','False'],
+                     nargs='*', default=None, help="Force evaluation prompt "
+                     "values to be (None=any | True=in | False=out-of) "
+                     "vocabulary")
     exconf.add_argument('--features', choices=['True','False'], nargs='+',
                      required=True,
                      help="Express prompt/ICL using features instead of purer "
@@ -641,12 +727,18 @@ if __name__ == '__main__':
             raise ValueError("--context-length MUST be specified to use "
                              "proportion of context length for examples!")
         args.n_examples = float(args.n_examples[1:])
-        args.context_length = int(args.context_length * args.n_examples)
+        args.token_limit = int(args.context_length * args.n_examples)
     else:
         args.n_examples = int(args.n_examples)
+    if args.icl_in_vocab is None:
+        args.icl_in_vocab = ['None']
+    if args.eval_in_vocab is None:
+        args.eval_in_vocab = ['None']
     # Boolean conversions
-    for argname in ['strict','negatives','features','encourage_rewrites']:
-        setattr(args, argname, [a == 'True' for a in getattr(args, argname)])
+    for argname in ['strict','negatives','features','encourage_rewrites',
+                    'icl_in_vocab','eval_in_vocab']:
+        setattr(args, argname, [None if a == 'None' else a == 'True' \
+                                for a in getattr(args, argname)])
     if args.symbols is not None:
         if len(args.operators) != len(args.symbols):
             raise ValueError("Must use default symbols or provide one symbol "
@@ -686,56 +778,62 @@ if __name__ == '__main__':
     # Precompute loop iteration counters so we can tqdm it
     n_to_compute =  llm_generations * len(args.operators) * len(args.n_digits) *\
                     len(args.negatives) * len(args.features) *\
-                    len(args.encourage_rewrites) * len(args.prompts)
+                    len(args.encourage_rewrites) * len(args.icl_in_vocab) *\
+                    len(args.eval_in_vocab) * len(args.prompts)
     overall_progress = tqdm.tqdm(total=n_to_compute)
     # Cumulative results of program execution
     results = dict()
     # Nest allllll the loops
     for (name, op, substitution) in zip(args.operators, used_op_calls, substitutions):
-        for N_DIGITS in args.n_digits:
-            for NEGATIVE in args.negatives:
-                for STRICTNESS in args.strict:
-                    for FEATURE_EXPRESSION in args.features:
-                        for REWRITE in args.encourage_rewrites:
-                            for PROMPT_SETTING in args.prompts:
-                                print(f"Trying LLM on operator '{name}' with "
-                                      f"{PROMPT_SETTING} prompt style for "
-                                      f"{'strictly' if STRICTNESS else 'up to'} "
-                                      f"{N_DIGITS} digit values that "
-                                      f"{'are not' if not NEGATIVE else 'may be'}"
-                                      " negative using text expressions in "
-                                      f"{'mathematical' if not FEATURE_EXPRESSION else 'feature'}"
-                                      f" notation{' with rewriting' if REWRITE else ''}.")
-                                if PROMPT_SETTING == 'icl':
-                                    bonus_kwargs = {}
-                                elif PROMPT_SETTING == 'system':
-                                    if name == 'special_operation':
-                                        print("Skipping special_operation on system"
-                                              " message only -- nothing of value "
-                                              "to learn.")
-                                        overall_progress.update(n=1)
-                                        continue
-                                    bonus_kwargs = {'with_context': False}
-                                elif PROMPT_SETTING == 'icl+system':
-                                    bonus_kwargs = {'use_both': True}
-                                elif PROMPT_SETTING == 'none':
-                                    bonus_kwargs = {'no_prompt': True}
-                                else:
-                                    raise NotImplemented(PROMPT_SETTING)
-                                result_wrapper(results,
-                                                args.file,
-                                                llm_examples,
-                                                op,
-                                                tqdm_updater=overall_progress,
-                                                n_examples=args.n_examples,
-                                                context_length=args.context_length,
-                                                n_evals=args.n_evals,
-                                                max_digits=N_DIGITS,
-                                                strict_digits=STRICTNESS,
-                                                include_negative=NEGATIVE,
-                                                feature_expression=FEATURE_EXPRESSION,
-                                                substitution_operand=substitution,
-                                                encourage_rewrites=REWRITE,
-                                                **bonus_kwargs)
+        # ... using itertools product
+        for (N_DIGITS, NEGATIVE, STRICTNESS, FEATURE_EXPRESSION, REWRITE,
+             ICL_IN_VOCAB, EVAL_IN_VOCAB, PROMPT_SETTING) in \
+                itertools.product(args.n_digits, args.negatives, args.strict,
+                                  args.features, args.encourage_rewrites,
+                                  args.icl_in_vocab, args.eval_in_vocab,
+                                  args.prompts):
+            print(f"Trying LLM on operator '{name}' with {PROMPT_SETTING} "
+                  f"prompt style for {'strictly' if STRICTNESS else 'up to'} "
+                  f"{N_DIGITS} digit values that "
+                  f"{'are not' if not NEGATIVE else 'may be'} "
+                  f"negative ({'no' if ICL_IN_VOCAB is None else ICL_IN_VOCAB} "
+                  "vocab preference for ICL; "
+                  f"{'no' if EVAL_IN_VOCAB else EVAL_IN_VOCAB} vocab preference"
+                  " for evaluations) using text expressions in "
+                  f"{'mathematical' if not FEATURE_EXPRESSION else 'feature'} "
+                  f"notation{' with rewriting' if REWRITE else ''}.")
+            if PROMPT_SETTING == 'icl':
+                bonus_kwargs = {}
+            elif PROMPT_SETTING == 'system':
+                if name == 'special_operation':
+                    print("Skipping special_operation on system"
+                          " message only -- nothing of value "
+                          "to learn.")
+                    overall_progress.update(n=1)
+                    continue
+                bonus_kwargs = {'with_context': False}
+            elif PROMPT_SETTING == 'icl+system':
+                bonus_kwargs = {'use_both': True}
+            elif PROMPT_SETTING == 'none':
+                bonus_kwargs = {'no_prompt': True}
+            else:
+                raise NotImplemented(PROMPT_SETTING)
+            result_wrapper(results,
+                            args.file,
+                            llm_examples,
+                            op,
+                            tqdm_updater=overall_progress,
+                            n_examples=args.n_examples,
+                            token_limit=args.token_limit,
+                            n_evals=args.n_evals,
+                            max_digits=N_DIGITS,
+                            strict_digits=STRICTNESS,
+                            include_negative=NEGATIVE,
+                            feature_expression=FEATURE_EXPRESSION,
+                            substitution_operand=substitution,
+                            encourage_rewrites=REWRITE,
+                            icl_in_vocab=ICL_IN_VOCAB,
+                            eval_in_vocab=EVAL_IN_VOCAB,
+                            **bonus_kwargs)
     print(results)
 
