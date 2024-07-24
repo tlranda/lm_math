@@ -5,3 +5,5 @@
 *.png
 *.json
 *.csv
+# Symlink to relevant portion of llama-models repository
+lm_tokenizers/llama3_1/llama_models_api

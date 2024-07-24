@@ -56,17 +56,19 @@ import tqdm
 import ollama
 from transformers import GPT2TokenizerFast
 # Local file python imports
-# none
+import lm_tokenizers
 
 LLM_MODEL = 'llama3'
 LLM_SEEDS = [1,2024,104987552,404,1337,987654321,777,13,4898,10648]
 OLLAMA_CONFIGS = []
+tokenizer = None
+number_vocab_int = None
 # At some point, this tokenizer needs to become pickable - but for now we'll
 # always assume that a GPT2 tokenizer is appropriate
-tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
+#tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
 # Make a vocab of numbers one time
-number_vocab = np.array(sorted(set([int(_) for _ in tokenizer.vocab.keys()\
-                                    if re.match(r"-?\d+", _)])))
+#number_vocab_int = np.array(sorted(set([int(_) for _ in tokenizer.vocab.keys()\
+#                                    if re.match(r"-?\d+", _)])))
 
 def bitshift_list(i_value, max_bits=None):
     if max_bits is None:
@@ -195,16 +197,16 @@ def generate_operands(n_to_create: int,
             operands[np.where(np.random.rand(n_to_create) < 0.5)[0]] *= -1
     else:
         # Start with non-negative set
-        gte_min = np.where(number_vocab >= min_value)[0]
-        lt_max = np.where(number_vocab < max_value)[0]
-        tokens_in_range = number_vocab[np.intersect1d(gte_min,lt_max,
+        gte_min = np.where(number_vocab_int >= min_value)[0]
+        lt_max = np.where(number_vocab_int < max_value)[0]
+        tokens_in_range = number_vocab_int[np.intersect1d(gte_min,lt_max,
                                                       assume_unique=True)]
         if include_negative:
             # Generally I expect negative values to not be individual tokens,
             # but check anyways
-            gte_min = np.where(number_vocab <= -1*min_value)[0]
-            lt_max = np.where(number_vocab > -1*max_value)[0]
-            negative_range = number_vocab[np.intersect1d(gte_min,lt_max,
+            gte_min = np.where(number_vocab_int <= -1*min_value)[0]
+            lt_max = np.where(number_vocab_int > -1*max_value)[0]
+            negative_range = number_vocab_int[np.intersect1d(gte_min,lt_max,
                                                          assume_unique=True)]
             # If empty it will upcast to float, which messes up hstack's type
             # as well
@@ -217,7 +219,7 @@ def generate_operands(n_to_create: int,
             tokened = len(tokens_in_range) / n_possible
             if tokened == 1.0:
                 # It's not possible to sample out-of-vocabulary for this setup
-                raise ValueError(f"All {max_digit}-digit integers are in-token "
+                raise ValueError(f"All {max_digits}-digit integers are in-token "
                                  f"vocabulary")
             elif tokened >= 0.2:
                 # Rejection sampling would possibly be bad, and this list
@@ -674,6 +676,9 @@ if __name__ == '__main__':
     llmconf.add_argument("--select-seeds", type=int, default=None, nargs="*",
                      help="Select subset of default LLM seeds via 0-indexing. "
                           "Alternative to --seeds (default: %(default)s)")
+    llmconf.add_argument("--tokenizer", choices=lm_tokenizers.IMPLEMENTERS,
+                     default=lm_tokenizers.IMPLEMENTERS[0],
+                     help="Tokenizer used for parsing (default: %(default)s)")
     opconf = prs.add_argument_group("Operator Settings")
     opconf.add_argument("--operators", choices=op_names, default=None, nargs='+',
                      required=True, help="Operators to test the LLM against")
@@ -753,6 +758,9 @@ if __name__ == '__main__':
                       for name in args.operators]
     used_op_calls = [op_calls[op_names.index(name)] for name in args.operators]
 
+    # Load the tokenizer and number vocabulary
+    tokenizer = getattr(lm_tokenizers, args.tokenizer+'_tk')
+    number_vocab_int = getattr(lm_tokenizers, args.tokenizer+'_number_vocab_int')
     # Create the options list
     for seed in LLM_SEEDS:
         """

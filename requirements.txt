@@ -4,3 +4,6 @@ matplotlib
 tqdm
 ollama
 transformers
+tiktoken
+pydantic
+termcolor
