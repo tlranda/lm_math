@@ -16,32 +16,22 @@ import operator
 # Dependent python imports
 # none
 # Local file python imports
-from special_operation import special_operation
+# Add any new operators/functionalities by following instructions in
+# `op_extensions.py`
+import op_extensions
 
-# Friendly name the LLM may be allowed to read, needs to be an operator or
-# callable name imported above into the global namespace
-op_names = ['special_operation','add','mod','mul','pow','sub']
-# Accurate sign corresponding to the friendly name
-op_signs = ['†','+','%','*','^','-']
-# Possibly inaccurate name shown to the LLM; any discrepancy will be explained
-# to the LLM in the prompt.
+# Name (which is also an argument), sign (used to represent the operation), and
+# call to execute the operation
+operator_names = ['add','mod','mul','pow','sub']
+operator_signs = ['+','%','*','^','-']
+operator_calls = [getattr(operator,op) for op in operator_names]
+# Extend with local extensions
+op_names = operator_names + op_extensions.names
+op_signs = operator_signs + op_extensions.signs
+op_calls = operator_calls + op_extensions.calls
+# A runtime argument allows any operation's sign to be re-aliased; this list
+# has the default values (the correct indiciated sign)
 op_use_signs = [_ for _ in op_signs]
-###############################################################################
-#                                                                             #
-#           Below here are automated setups based on the above                #
-#               just let the program set these up for you                     #
-#                                                                             #
-###############################################################################
-op_calls = []
-for op in op_names:
-    try:
-        func = getattr(operator,op)
-    except AttributeError:
-        try:
-            func = globals()[op]
-        except KeyError:
-            raise NotImplemented(f"No known callable for operator '{op}'")
-    op_calls.append(func)
 
 # Builtin python imports (continued)
 import argparse
@@ -63,22 +53,6 @@ LLM_SEEDS = [1,2024,104987552,404,1337,987654321,777,13,4898,10648]
 OLLAMA_CONFIGS = []
 tokenizer = None
 number_vocab_int = None
-# At some point, this tokenizer needs to become pickable - but for now we'll
-# always assume that a GPT2 tokenizer is appropriate
-#tokenizer = GPT2TokenizerFast.from_pretrained("gpt2")
-# Make a vocab of numbers one time
-#number_vocab_int = np.array(sorted(set([int(_) for _ in tokenizer.vocab.keys()\
-#                                    if re.match(r"-?\d+", _)])))
-
-def bitshift_list(i_value, max_bits=None):
-    if max_bits is None:
-        max_bits = len(OLLAMA_CONFIGS)
-    n_values = 0
-    blist = []
-    while n_values < max_bits:
-        blist.append((i_value>>n_values) % 2)
-        n_values += 1
-    return blist
 
 def tokenize(str_: Union[str,List[str],dict,List[dict]],
              count: bool = False) -> Union[List[str], List[List[str]], int]:
@@ -86,15 +60,15 @@ def tokenize(str_: Union[str,List[str],dict,List[dict]],
         Wrapper to the tokenizer that gives access to the actual substrings
         that form individual tokens from an input string.
 
-        If count==True, only return the count (or sum count of list)
+        `str_`: The string-like data (or nested structure with string-like data)
+                to tokenize. Dictionaries are expected to be LLM-JSON responses
+        `count`: Return the count of tokens composing the `str_` data rather
+                 than the series of tokens
     """
     if isinstance(str_, str):
-        # Some special characters can be encoded strangely, removing spaces
-        # from the input string usually resolves the issue but is less accurate
-        # to what the LLM perceives
+        # Not every tokenizer directly supports a count argument, so just count
+        # the length of the returned list
         decoded = tokenizer.tokenize(str_)
-        #encoded_ids = tokenizer.encode_plus(str_)['input_ids']
-        #decoded = tuple([tokenizer.decode(_) for _ in encoded_ids])
         if count:
             return len(decoded)
         else:
@@ -102,7 +76,7 @@ def tokenize(str_: Union[str,List[str],dict,List[dict]],
     # Permit operating directly on a message dictionary
     if isinstance(str_, dict):
         return tokenize(str_['content'], count=count)
-    # Permit recursion on lists in case I bulk-tokenize
+    # Permit recursion on lists to support bulk-tokenizing
     if isinstance(str_, list):
         all_strs = []
         for s_ in str_:
@@ -113,60 +87,43 @@ def tokenize(str_: Union[str,List[str],dict,List[dict]],
             return all_strs
     raise NotImplemented
 
-def natural_language_math(operands_list: List[int],
+def natural_language_math(operands_list: List[object],
                           op: callable,
+                          answer: object,
                           with_answer: bool = True,
-                          aggregate: bool = True,
                           feature_expression: bool = False,
-                          feature_names: List[str] = None)\
-    -> List[Dict[str,str]]:
+                          feature_names: List[str] = None,
+                          ) -> List[Dict[str,str]]:
     """
         Take a list of operands (every 2 operands form an expression) and make
         the natural language expression of each expression based on the
         provided callable.
 
+        `operands_list`: List of inputs for expressions
         `with_answer`: Include the answer by calling the operation to compute
                        the actual value and display it after the equals sign.
-        `aggregate`: Combine examples using newlines as delimiters instead of
-                     multiple separate messages.
         `feature_expression`: Convert from operand-operator-operand to a more
                               natural language format.
         `feature_names`: Replace 'operand_X' with a special name that may have
                          significance the LLM can meaningfully use to improve
                          its odds at generating valuable answers.
     """
-    messages = []
     msg = ""
-    for (op_left, op_right) in zip(operands_list[::2], operands_list[1::2]):
-        # Always provide the expression
-        if feature_expression:
-            msg += f"operator is {op_use_signs[op_calls.index(op)]}, "
-            msg += 'operand_0' if feature_names is None else feature_names[0]
-            msg += f" is {op_left}, "
-            msg += 'operand_1' if feature_names is None else feature_names[1]
-            msg += f" is {op_right} | Answer = "
-        else:
-            msg += f"{op_left} {op_use_signs[op_calls.index(op)]} {op_right} = "
-        # Optionally provide the answer
-        if with_answer:
-            msg += f"## {op(op_left,op_right)} ##"
-        # Aggregation across loop bounds
-        if aggregate:
-            msg += "\n"
-        else:
-            messages.append({'role': 'user', 'content': msg})
-            msg = ""
-    # Cleanup for final loop / multiline aggregation
-    if msg != "":
-        messages.append({'role': 'user', 'content': msg})
-    return messages
-
-def show_last_results(results: List[int]) -> None:
-    """
-        I'm dumb and using bits to compress these results, so this helps you
-        read the bits as a string in a debugging fashion
-    """
-    print(" | ".join([f"{k}: {bitshift_list(results[k][-1])}" for k in results]))
+    if feature_expression:
+        msg += f"operator is {op_use_signs[op_calls.index(op)]}, "
+        msg += ", ".join([f"operand_{idx}" if name is None else name \
+                          + f" is {val}"
+                          for idx, (val, name) in \
+                            enumerate(zip(operands_list, feature_names))])
+        msg += " output is "
+    else:
+        msg += f"{' '.join([str(_) for _ in operands_list[:len(operands_list)//2]])}"
+        msg += f" {op_use_signs[op_calls.index(op)]} "
+        msg += f"{' '.join([str(_) for _ in operands_list[len(operands_list)//2:]])}"
+        msg += " = "
+    if with_answer:
+        msg += f"## {answer} ##"
+    return msg
 
 def generate_operands(n_to_create: int,
                       max_digits: int,
@@ -213,7 +170,7 @@ def generate_operands(n_to_create: int,
             negative_range = negative_range.astype(int)
             tokens_in_range = np.hstack((negative_range,tokens_in_range))
         if in_vocab:
-            operands = np.random.choice(token_in_range, size=n_to_create)
+            operands = np.random.choice(tokens_in_range, size=n_to_create)
         else:
             # Determine power and representations for best sampling strategy
             tokened = len(tokens_in_range) / n_possible
@@ -241,7 +198,310 @@ def generate_operands(n_to_create: int,
                 operands = selections[:n_to_create]
     return operands
 
+def make_system_prompt(op: callable,
+                       with_context: bool,
+                       use_both: bool,
+                       substitution_operand: Optional[Tuple[str,str]],
+                       encourage_rewrites: bool,
+                       token_expenditure: int,
+                       count_tokens: bool) -> Tuple[Dict[str,str],str,int]:
+    """
+        Write the system prompt dictionary based on relevant settings.
+        Return this dictionary, an operation explanation, and the updated token
+        expenditure count.
+
+        `op`: The callable function to utilize for these tests
+        `with_context`: Generate ICL using natural_language_math, to be
+                        presented to the LLM prior to each task as ground-truth
+                        examples. This REPLACES the system prompt as
+                        instructions, so ICL is all that the LLM will have for
+                        context of its task to complete.
+        `use_both`: Generate ICL using natural_language_math and ADD this as
+                    additional instructions for the LLM to support proper task
+                    fulfillment.
+        `substitution_operand`: When provided, an exchanged pair of strings to
+                                explain to the LLM that notation generated by
+                                natural_language_math may use unfamiliar
+                                operators (typical_string, actual_string). This
+                                gives the LLM additional prompting to explain
+                                this substitution and encourages it to take
+                                measures that increase its likelihood of
+                                overcoming the substitution and answering
+                                correctly.
+        `encourage_rewrites`: When a substitution is made, encourage the LLM
+                              to rewrite the expression to its ground-truth
+                              prior to submitting its answer. This should
+                              benefit the LLM by permitting its memorization
+                              to work more effectively than a completely
+                              context-based symbol substitution.
+        `token_expenditure`: Current token usage count
+        `count_tokens`: Update the count of tokens based on content of the system messages
+    """
+    # Default system message (conditionally included in LLM prompt)
+    system_messages = [{'role': 'system',
+                        'content': 'You are a helpful AI assistant. You will '
+                                   'be presented with a series of one or more '
+                                   'expressions. Assume all given examples are '
+                                   'correct, then use your knowledge to '
+                                   'respond with the correct answer for the '
+                                   'challenge expression that is left '
+                                   'unanswered. Your answer for the challenge '
+                                   'should be surrounded by "##" characters, '
+                                   'ie: ## 1 ##.\n'}]
+    # The special operation should be impossible for the LLM to observe in its
+    # training data; ergo it is only fair to explain to the LLM what this
+    # operation is generally anticipated to mean. However, we're using this as
+    # a check against memorizing ICL data, so an exact representation is
+    # unnecessary
+    op_explanation = ""
+    if op in op_extensions.calls:
+        op_explanation = f'The \'{op_use_signs[op_calls.index(op)]}\' symbol '
+        op_explanation += op_extensions.description
+        if not op_explanation.endswith('\n'):
+            op_explanation += "\n"
+    elif substitution_operand is not None and \
+         substitution_operand[0] != substitution_operand[1]:
+        # For non-special operations, if there's an indication that a
+        # nontraditional symbol/name for the operator will be used by
+        # natural_language_math, we can explain to the LLM what substitution
+        # occurs.
+        # This allows us to see if text manipulation can overcome a harder
+        # version of memorizing, where special contextual rules override
+        # the commonly memorized patterns.
+        op_explanation = f"As an added twist, the {substitution_operand[1]} "+\
+                        "symbol will be used in place of "+\
+                        f"{substitution_operand[0]}. Please consider every "+\
+                        f"use of {substitution_operand[1]} to be "+\
+                        f"{substitution_operand[0]}"
+        if encourage_rewrites:
+            op_explanation += " and rewrite the operation replacing uses of "+\
+                        f"{substitution_operand[1]} with "+\
+                        f"{substitution_operand[0]} prior to indicating your "+\
+                        "answer."
+    system_messages[0]['content'] += op_explanation
+    # Only contributes to count if we utilize the system messages
+    if count_tokens and use_both or not with_context:
+        token_expenditure += tokenize(system_messages, count=True)
+        print(f"Token count for system messages: {token_expenditure}")
+    return system_messages, op_explanation, token_expenditure
+
+def make_prompts(op: callable,
+                 n_prompts: int,
+                 with_answer: bool,
+                 aggregate: bool,
+                 max_digits: int,
+                 strict_digits: bool,
+                 include_negative: bool,
+                 feature_expression: bool,
+                 require_in_vocab: bool,
+                 first_extension: Optional[str] = None,
+                 each_extension: Optional[str] = None,
+                 limit: Optional[int] = None) -> Tuple[List[Dict[str,str]], List[int], int, int]:
+    """
+        Create prompts for evaluations, return the prompt dict, the answers
+        and the total token count as well as the longest prompt's token count
+
+        `op`: The callable function to utilize for these tests
+        `n_prompts`: The number of different expressions given to the LLM for
+                     evaluating across different inputs. NOTE that the LLM will
+                     use each configuration PER eval, so the total number of LLM
+                     calls produced by this function are actually:
+                        len(OLLAMA_CONFIGS) * n_prompts
+                     Whether offline or online, plan your usage accordingly.
+        `with_answer`: Determines if answer is included in natural language
+                       prompt
+        `aggregate`: Combine multiple prompts into a single content message
+        `max_digits`: The maximum base-10 integers to generate in this
+                      procedure are: |10 ^ (max_digits)|
+        `strict_digits`: Guarantee maximum digits are used
+        `include_negative`: Permits negative operand values
+        `feature_expression`: Passed directly to uses of natural_language_math
+        `require_in_vocab`: Prefer operands to be (in/out of) vocabulary single
+                            tokens (unless None, wherein no preference)
+        `first_extension`: Bonus text to prefix the very first prompt with
+        `each_extension`: Bonus text to prefix every prompt with
+        `limit`: Generate until a certain number of tokens would be exceeded,
+                 regardless of n_prompts
+    """
+    prompt_queue = []
+    prompt_answers = []
+    total_prompt_len = 0
+    longest_prompt_tokens = 0
+    while limit is not None or (len(prompt_queue) < n_prompts):
+        # Challenges for the LLM to solve are generated and converted into natural
+        # language prompts based on desired settings
+        prompt_operands = generate_operands(2,
+                                            max_digits,
+                                            strict_digits,
+                                            include_negative,
+                                            in_vocab=require_in_vocab)
+        # Ground-truth answers to check LLM against
+        answer = op(*prompt_operands)
+        try:
+            # Use .item() to convert numpy-dtypes to python, which are
+            # JSON-serializable
+            answer = answer.item()
+        except AttributeError:
+            pass
+        if not with_answer:
+            prompt_answers.append(answer)
+        prompt = natural_language_math(prompt_operands,
+                                       op,
+                                       answer,
+                                       with_answer=with_answer,
+                                       feature_expression=feature_expression)
+        if len(prompt_queue) == 0 and first_extension is not None:
+            prompt = first_extension + prompt
+        if each_extension is not None:
+            prompt = each_extension + prompt
+        prompt = {'role': 'user', 'content': prompt}
+        new_prompt_len = tokenize(prompt, count=True)
+        longest_prompt_tokens = max(new_prompt_len, longest_prompt_tokens)
+        if limit is not None:
+            if total_prompt_len + new_prompt_len >= limit:
+                break
+            total_prompt_len += new_prompt_len
+            print(f"Prompt {len(prompt_queue)+1} adds {new_prompt_len} tokens, "
+                  f"running total: {total_prompt_len}")
+        else:
+            total_prompt_len += new_prompt_len
+        prompt_queue.append(prompt)
+    if aggregate:
+        # Flatten into a single message
+        prompt_queue = [{'role': 'user', 'content': "\n".join([p['content'] \
+                                                    for p in prompt_queue])}]
+
+    return prompt_queue, prompt_answers, total_prompt_len, longest_prompt_tokens
+
+def posteval_llm_trial(trial_history_ref: Dict,
+                       known_values: Dict,
+                       tokenized_trial: List[str],
+                       answer: object,
+                       response: Dict):
+    """
+        Attempt to automatically parse LLM response to determine certain
+        attributes it may exhibit, such as following the intended format,
+        producing a parseable answer, copying ICL data, or producing the right
+        answer.
+
+        `trial_history_ref`: Sub-dictionary for this series of trials to update
+        `known_values`: Copycat dictionary to check if LLM may be copying ICL
+        `tokenized_trial`: Representation of this trial in token-form
+        `answer`: Actual answer the LLM should produce
+        `reponse`: LLM's JSON-style response
+    """
+    # We check if the LLM memorized this answer
+    llm_answer_tokenized = tuple(tokenize(response['message']))
+    if llm_answer_tokenized in known_values:
+        if tokenized_trial in known_values[llm_answer_tokenized]:
+            print("This is a verbatim memorized answer")
+            trial_history_ref['memorized_verbatim'][-1] = 1
+        else:
+            print("This is a previously-seen memorized answer (copycat), "
+                  "but it is answering a different trial input")
+            trial_history_ref['memorized_copycat'][-1] = 1
+    # We check if the LLM followed our requested output format and
+    # attempt to parse a comparable value to verify correctness
+
+    # TODO: Permit these regexes to be defined as shallowregex (here) and
+    # deepregex (second .findall, below) so operator extensions can match more
+    # diverse types of output
+    regex_portion = re.findall(r"## ?(-?\d+) ?##",
+                               response['message']['content'])
+    if regex_portion:
+        trial_history_ref['follows_regex'][-1] = 1
+        # No try/except here, following the regex SHOULD make this
+        # parse, and if not I want the program to crash so I can see
+        # the bug. We choose the last match in case the LLM repeated
+        # some ICL examples.
+        llm_answer = type(answer)(regex_portion[-1])
+        print("LLM followed requested output format and answered:", llm_answer)
+    else:
+        # Sometimes the LLM responds with JUST a number.
+        # Sometimes it likes to yap a little bit and then give its
+        # answer.
+        # Sometimes we explicitly instruct the LLM to rephrase things
+        # before giving its answer.
+        # In all-of-the-above cases, we reasonably expect the FINAL
+        # number produced by the LLM to be its actual answer, even if
+        # it talks further than the final number.
+        #
+        # NOTE: If you limit the number of tokens in the LLM response,
+        # this might successfully parse a number that is clearly not
+        # the LLM's answer because its response was truncated. We
+        # do not defensively program around this case, but YOU should
+        # be aware of it, especially on tight token limits or if your
+        # LLM is producing mountains of text for some reason.
+        try:
+            final_match = re.findall(r"\D*?(-?\d+)",
+                                     response['message']['content'])[-1]
+            llm_answer = type(answer)(final_match)
+            print("LLM DID NOT follow requested output format, but we "
+                  "recovered this value as its possible answer:", llm_answer)
+        except:
+            print("LLM DID NOT follow requested output format, and we were "
+                  "UNABLE to recover any value as its possible answer")
+            return trial_history_ref
+    trial_history_ref['parseable'][-1] = 1
+    print("LLM's answer is ", end='')
+    if llm_answer == answer:
+        print("correct")
+        trial_history_ref['correct'][-1] = 1
+    else:
+        print("INCORRECT")
+    return trial_history_ref
+
+def llm_trial(mstate: List[Dict[str,str]],
+              answer: object,
+              trial_history_ref: Dict,
+              known_values: Dict,
+              tqdm_updater: Optional[tqdm.tqdm],
+              save_file: str,
+              ) -> Dict:
+    """
+        Repeat a trial across all OLLAMA_CONFIGS, logging results to disk.
+        Return updated trial history
+
+        `mstate`: Initial state for the trial (all prompt messages in history)
+        `answer`: Correct answer the LLM should produce post-parsing
+        `trial_history_ref`: Sub-dictionary for this series of trials to update
+        `known_values`: Copycat dictionary to check if LLM may be copying ICL
+        `tqdm_updater`: Progress bar handle to update with each generated response
+        `save_file`: Path to save results to
+    """
+    trial = mstate[-1]
+    tokenized_trial = None if len(known_values) == 0 else tuple(tokenize(trial))
+    for (attempt,CONFIG) in enumerate(OLLAMA_CONFIGS):
+        # The LLM produces its answer
+        print(f"LLM Attempt {attempt+1}/{len(OLLAMA_CONFIGS)}")
+        response = ollama.chat(model=LLM_MODEL,
+                               messages=mstate,
+                               options=CONFIG)
+        trial_history_ref['time'].append(response['eval_duration'] / 1e9)
+        trial_history_ref['response'].append(response['message']['content'])
+        tlens = list(map(len, list(trial_history_ref.values())[1:]))
+        max_tlen = max(tlens)
+        for key, tlen in zip(list(trial_history_ref.keys())[1:], tlens):
+            trial_history_ref[key].extend([0] * (max_tlen-tlen))
+        print(f"TRUTH: {trial['content']}## {answer} ##")
+        print(f"Response {attempt+1}/{len(OLLAMA_CONFIGS)}: "
+              f"{trial['content']}{response['message']['content']}")
+        trial_history_ref = posteval_llm_trial(trial_history_ref,
+                                               known_values,
+                                               tokenized_trial,
+                                               answer,
+                                               response)
+        if tqdm_updater is not None:
+            tqdm_updater.update(n=1)
+        # Update results per LLM response, so we save everything that was
+        # completely handled
+        with open(save_file, 'w') as f:
+            json.dump(trial_history_ref, f, indent=1)
+    return trial_history_ref
+
 def llm_examples(op: callable,
+                 trial_history: Dict,
+                 save_file: str,
                  tqdm_updater: tqdm.tqdm = None,
                  n_examples: Union[int,float] = 10,
                  token_limit: Optional[int] = None,
@@ -253,22 +513,17 @@ def llm_examples(op: callable,
                  with_context: bool = True,
                  use_both: bool = False,
                  feature_expression: bool = False,
-                 substitution_operand: Union[None,Tuple[str,str]] = None,
+                 substitution_operand: Optional[Tuple[str,str]] = None,
                  encourage_rewrites: bool = False,
                  icl_in_vocab: Optional[bool] = None,
                  eval_in_vocab: Optional[bool] = None,
                  ) -> Dict[str, Dict[str, int]]:
     """
         Main driver function of the test battery this script intends to provide.
-        The return dictionary is one of metric names mapping to distribution
-        information. For now, that is:
-            {Metric_Name: {
-                    'Observed': Number_of_Metric_Successes,
-                    'Out_of': Number_of_Metric_Trials,
-                }
-            }
 
         `op`: The callable function to utilize for these tests
+        `trial_history`: History of prior evaluations to update with new ones
+        `save_file`: Path to save updated trial_history to
         `tqdm_updater`: tqdm.tqdm object to update once per LLM generation-and-
                         parse
         `n_examples`: The number of examples to provide for ICL to the LLM,
@@ -288,18 +543,18 @@ def llm_examples(op: callable,
         `strict_digits`: Guarantee maximum digits are used
         `include_negative`: Permits negative operand values
         `no_prompt`: Do not supply any prompts explaining the task to perform
-        `with_context`: Generate ICL using natural_language_math(), to be
+        `with_context`: Generate ICL using natural_language_math, to be
                         presented to the LLM prior to each task as ground-truth
                         examples. This REPLACES the system prompt as
                         instructions, so ICL is all that the LLM will have for
                         context of its task to complete.
-        `use_both`: Generate ICL using natural_language_math() and ADD this as
+        `use_both`: Generate ICL using natural_language_math and ADD this as
                     additional instructions for the LLM to support proper task
                     fulfillment.
-        `feature_expression`: Passed directly to uses of natural_language_math()
+        `feature_expression`: Passed directly to uses of natural_language_math
         `substitution_operand`: When provided, an exchanged pair of strings to
                                 explain to the LLM that notation generated by
-                                natural_language_math() may use unfamiliar
+                                natural_language_math may use unfamiliar
                                 operators (typical_string, actual_string). This
                                 gives the LLM additional prompting to explain
                                 this substitution and encourages it to take
@@ -324,122 +579,64 @@ def llm_examples(op: callable,
     count_tokens = token_limit is not None and isinstance(n_examples, float)
 
     ###########################################################################
-    #                                                                         #
-    #                        Create the system prompt                         #
-    #                                                                         #
+    #                    Create all prompt materials                          #
     ###########################################################################
 
-    # System message (conditionally included in LLM prompt)
-    system_messages = [{'role': 'system',
-                        'content': 'You are a helpful AI assistant. When '
-                                   'presented with a mathematical expression '
-                                   'or equation, respond with the numeric '
-                                   'value that correctly completes the input '
-                                   'surrounded by "##" characters, ie: '
-                                   '## 1 ##.'}]
-    # The special operation should be impossible for the LLM to observe in its
-    # training data; ergo it is only fair to explain to the LLM what this
-    # operation is generally anticipated to mean. However, we're using this as
-    # a check against memorizing ICL data, so an exact representation is
-    # unnecessary
-    op_explanation = ""
-    if op == special_operation:
-        op_explanation = f'The \'{op_use_signs[op_calls.index(op)]}\' symbol '
-        op_explanation += 'represents a special nonlinear operation that always '
-        'returns integer values. Do not attempt to explain '
-        'what it does, only provide your best guess of what '
-        'the correct value for this operation is given the '
-        'provided inputs.'
-        system_messages[0]['content'] += " "+op_explanation
-    elif substitution_operand is not None and \
-         substitution_operand[0] != substitution_operand[1]:
-        # For non-special operations, if there's an indication that a
-        # nontraditional symbol/name for the operator will be used by
-        # natural_language_math(), we can explain to the LLM what substitution
-        # occurs.
-        # This allows us to see if text manipulation can overcome a harder
-        # version of memorizing, where special contextual rules override
-        # the commonly memorized patterns.
-        op_explanation = f"As an added twist, the {substitution_operand[1]} "+\
-                        "symbol will be used in place of "+\
-                        f"{substitution_operand[0]}. Please consider every "+\
-                        f"use of {substitution_operand[1]} to be "+\
-                        f"{substitution_operand[0]}"
-        if encourage_rewrites:
-            op_explanation += " and rewrite the operation replacing uses of "+\
-                        f"{substitution_operand[1]} with "+\
-                        f"{substitution_operand[0]} prior to indicating your "+\
-                        "answer."
-        system_messages[0]['content'] += " "+op_explanation
-    # Only contributes to count if we utilize the system messages
-    if count_tokens and use_both or not with_context:
-        token_expenditure += tokenize(system_messages, count=True)
-        print(f"Token count for system messages: {token_expenditure}")
+    (system_messages,
+     op_explanation,
+     token_expenditure) = make_system_prompt(op,
+                                             with_context,
+                                             use_both,
+                                             substitution_operand,
+                                             encourage_rewrites,
+                                             token_expenditure,
+                                             count_tokens)
 
-    ###########################################################################
-    #                                                                         #
-    #                    Create the evaluation prompts                        #
-    #                                                                         #
-    ###########################################################################
+    (prompt_queue,
+     prompt_answers,
+     prompt_tokens,
+     longest_prompt_tokens) = make_prompts(op,
+                                           n_evals,
+                                           False, # Evaluation prompts lack answer
+                                           False, # Evaluation prompts are not aggregated
+                                           max_digits,
+                                           strict_digits,
+                                           include_negative,
+                                           feature_expression,
+                                           eval_in_vocab,
+                                           each_extension="CHALLENGE:\n")
+    # Token expenditure is updated based on longest eval prompt
+    token_expenditure += longest_prompt_tokens
 
-    # Challenges for the LLM to solve are generated and converted into natural
-    # language prompts based on desired settings
-    prompt_operands = generate_operands(n_evals*2, max_digits, strict_digits,
-                                        include_negative, in_vocab=eval_in_vocab)
-    prompt_queue = natural_language_math(prompt_operands,
-                        op,
-                        with_answer=False, # Challenges never include answer
-                        aggregate=False, # Only ask LLM one question at a time
-                        feature_expression=feature_expression)
-    # Ground-truth answers to check LLM against
-    prompt_answers = [op(pops_l, pops_r) for (pops_l, pops_r) \
-                      in zip(prompt_operands[::2], prompt_operands[1::2])]
-    # Ensure every prompt fits within context, but only one at a time is
-    # necessary so only add the longest prompt to the token count
-    if count_tokens:
-        prompt_lengths = [tokenize(prompt, count=True) for prompt in prompt_queue]
-        longest_prompt = np.argmax(prompt_lengths)
-        token_expenditure += prompt_lengths[longest_prompt]
-        print(f"Longest evaluation prompt adds {prompt_lengths[longest_prompt]}"
-              f" tokens, running total: {token_expenditure}")
-
-    ###########################################################################
-    #                                                                         #
-    #                         Create the ICL prompts                          #
-    #                                                                         #
-    ###########################################################################
-
-    icl_queue = []
+    limit = None if token_limit is None else token_limit-token_expenditure
+    (icl_queue,
+     icl_answers_empty,
+     prompt_tokens,
+     longest_prompt_tokens) = make_prompts(op,
+                                           n_examples,
+                                           True, # ICL prompts have answer
+                                           True, # ICL prompts are aggregated
+                                           max_digits,
+                                           strict_digits,
+                                           include_negative,
+                                           feature_expression,
+                                           icl_in_vocab,
+                                           first_extension="EXAMPLES:\n",
+                                           limit=limit)
+    # Token expenditure is updated based on collated prompts
+    token_expenditure += prompt_tokens
     # This logic combination DOESN'T have the system message, so ensure that
     # the special instructions are passed along via the ICL mechanism
     if op_explanation != "" and with_context and not use_both:
-        icl_queue = [{'role': 'system', 'content': op_explanation}]
+        icl_queue = [{'role': 'system', 'content': op_explanation}] + icl_queue
         if count_tokens:
             op_explanation_tokens = tokenize(op_explanation, count=True)
             token_expenditure += op_explanation_tokens
             print(f"Operation requires explanation, adding {op_explanation_tokens} "
                   f"tokens, running total: {token_expenditure}")
-    while (with_context or use_both) and \
-          (count_tokens or (len(icl_queue) < n_examples)):
-        icl_operands = generate_operands(2, max_digits, strict_digits,
-                                         include_negative, in_vocab=icl_in_vocab)
-        icl = natural_language_math(icl_operands,
-                                    op,
-                                    with_answer=True, # ICL always includes answer
-                                    feature_expression=feature_expression)
-        if count_tokens:
-            new_prompt_len = tokenize(icl, count=True)
-            if token_expenditure + new_prompt_len >= token_limit:
-                break
-            token_expenditure += new_prompt_len
-            print(f"ICL prompt {len(icl_queue)+1} adds {new_prompt_len} tokens, "
-                  f"running total: {token_expenditure}")
-        icl_queue.extend(icl)
 
     ###########################################################################
-    #                                                                         #
-    #                       Template for evaluations                          #
-    #                                                                         #
+    #                  Template for evaluations and results                   #
     ###########################################################################
 
     if no_prompt:
@@ -451,18 +648,10 @@ def llm_examples(op: callable,
     else:
         initial_mstate = system_messages
     print("Basic prompt without query:")
-    print("".join([_['content'] for _ in initial_mstate]))
+    trial_history['prompt_template'] = "".join([_['content'] for _ in initial_mstate])
+    print(trial_history['prompt_template'])
     if count_tokens:
         print(f"Counted tokens: {token_expenditure} / {token_limit}")
-        post_hoc = tokenize(initial_mstate+[prompt_queue[longest_prompt]],
-                            count=True)
-        print(f"Post-hoc count: {post_hoc}")
-
-    ###########################################################################
-    #                                                                         #
-    #                        Prepare for evaluations                          #
-    #                                                                         #
-    ###########################################################################
 
     # Prepare results to track through testing
     result_metrics = ['follows_regex', # The LLM responds as requested with
@@ -493,7 +682,6 @@ def llm_examples(op: callable,
                                            # commutative, the VERBATIM/COPYCAT
                                            # checks are NOT commutative.
                       ]
-    results = dict((k,list()) for k in result_metrics)
     # Set up the information for memorization checks when ICL is provided
     known_values = dict()
     if use_both or with_context:
@@ -513,145 +701,35 @@ def llm_examples(op: callable,
                     known_values[answer] = [trial]
 
     ###########################################################################
-    #                                                                         #
     #                          Perform evaluations                            #
-    #                                                                         #
     ###########################################################################
 
     for (trial, answer) in zip(prompt_queue, prompt_answers):
-        # Update for another trial
-        for k in results:
-            results[k].append(0)
-        # Add this trial's prompt to the queue of messages for the LLM
-        mstate = initial_mstate + [trial]
-        # Reset trial tokenized
-        llm_trial_tokenized = None
-        print(f"TRUTH: {trial['content']}## {answer} ##")
-        for (attempt,CONFIG) in enumerate(OLLAMA_CONFIGS):
-            # The LLM produces its answer
-            print(f"LLM Attempt {attempt+1}/{len(OLLAMA_CONFIGS)}")
-            response = ollama.chat(model=LLM_MODEL,
-                                   messages=mstate,
-                                   options=CONFIG)
-            print(f"Response {attempt+1}/{len(OLLAMA_CONFIGS)}: "
-                  f"{trial['content']}{response['message']['content']}")
-            # We check if the LLM memorized this answer
-            llm_answer_tokenized = tokenize(response['message'])
-            print("\t",f"Tokenized: {llm_answer_tokenized}")
-            if len(known_values) > 0 and \
-                tuple(llm_answer_tokenized) in known_values:
-                if llm_trial_tokenized is None:
-                    llm_trial_tokenized = tuple(tokenize(trial))
-                if llm_trial_tokenized in known_values[llm_answer_tokenized]:
-                    print("This is a verbatim memorized answer")
-                    results['memorized_verbatim'][-1] += (1 << attempt)
-                else:
-                    print("This is a previously-seen memorized answer "
-                          "(copycat), but it is answering a different trial "
-                          "input")
-                    results['memorized_copycat'][-1] += (1 << attempt)
-            # We check if the LLM followed our requested output format and
-            # attempt to parse a comparable value to verify correctness
-            regex_portion = re.findall(r"## ?(-?[0-9]+) ?##",
-                                       response['message']['content'])
-            if regex_portion:
-                results['follows_regex'][-1] += (1 << attempt)
-                # No try/except here, following the regex SHOULD make this
-                # parse, and if not I want the program to crash so I can see
-                # the bug. We choose the last match in case the LLM repeated
-                # some ICL examples.
-                llm_answer = int(regex_portion[-1])
-                print("LLM followed requested output format and gave answer:",
-                      llm_answer)
-            else:
-                # Sometimes the LLM responds with JUST a number.
-                # Sometimes it likes to yap a little bit and then give its
-                # answer.
-                # Sometimes we explicitly instruct the LLM to rephrase things
-                # before giving its answer.
-                # In all-of-the-above cases, we reasonably expect the FINAL
-                # number produced by the LLM to be its actual answer, even if
-                # it talks further than the final number.
-                #
-                # NOTE: If you limit the number of tokens in the LLM response,
-                # this might successfully parse a number that is clearly not
-                # the LLM's answer because its response was truncated. We
-                # do not defensively program around this case, but YOU should
-                # be aware of it, especially on tight token limits or if your
-                # LLM is producing mountains of text for some reason.
-                try:
-                    final_match = re.findall(r"\D*?(-?\d+)",
-                                             response['message']['content'])[-1]
-                    llm_answer = int(final_match)
-                    print("LLM DID NOT follow requested output format, but we "
-                          "recovered this value as its possible answer:",
-                          llm_answer)
-                except:
-                    print("LLM DID NOT follow requested output format, and we "
-                          "were UNABLE to recover any value as its possible "
-                          "answer")
-                    if tqdm_updater is not None:
-                        tqdm_updater.update(n=1)
-                    continue
-            results['parseable'][-1] += (1 << attempt)
-            print("LLM's answer is ", end='')
-            if llm_answer == answer:
-                print("correct")
-                results['correct'][-1] += (1 << attempt)
-            else:
-                print("INCORRECT")
-            if tqdm_updater is not None:
-                tqdm_updater.update(n=1)
-        show_last_results(results)
-
-    ###########################################################################
-    #                                                                         #
-    #                  Summarize results for logging and return               #
-    #                                                                         #
-    ###########################################################################
-
-    # Prepare results for return/logging
-    final_results = dict((k,dict()) for k in results.keys())
-    for (k,v) in results.items():
-        # Each trial has 1-bits to indicate per-LLM-config pass/fail.
-        # Show the sum of trial passes and compare to the total number of
-        # possible passes.
-        final_results[k]['observe'] = sum([sum(bitshift_list(vv)) for vv in v])
-        final_results[k]['out_of'] = len(OLLAMA_CONFIGS)*len(v)
-    return final_results
-
-def result_wrapper(results: dict,
-                   file_target: str,
-                   call: callable,
-                   *args, **kwargs) -> None:
-    """
-        Make a call with args/kwargs, then update a cumulative dictionary with
-        the results of that call based on the given arguments.
-        Log these results to a given filename in case the program is
-        interrupted.
-
-        We do not write to temporary->move after successfully writing, which
-        would be far more fault-tolerant. We expect the call to dominate runtime
-        and for interruptions to generally land there, ergo the odds of partial
-        file write corruption are pretty minimal.
-
-        If it bothers you, by all means patch it in.
-    """
-    new_val = call(*args, **kwargs)
-    # JSON cannot cope with many args/kwargs in a normal fashion, so make sure
-    # the key is represented as a string that reasonably parses for humans
-    new_key = str((*[a if not callable(a) else a.__name__ for a in args],
-                   *[f"{k if not callable(v) else k.__name__}:{v}" for (k,v) \
-                        in kwargs.items() if not isinstance(v, tqdm.tqdm)]))
-    results[new_key] = new_val
-    # Log this data to disk
-    with open(file_target,'w') as f:
-        json.dump(results,f,indent=1)
+        trialkey = trial['content']
+        trial_history[trialkey] = {'answer': answer,
+                                   'time': list(),
+                                   'response': list()}
+        trial_history[trialkey].update({k: list() for k in result_metrics})
+        # Update results (ALL trials, log that this one started so we know how
+        # to merge any temporary results)
+        with open(save_file, 'w') as f:
+            json.dump(trial_history, f, indent=1)
+        trial_history[trialkey] = llm_trial(initial_mstate + [trial],
+                                            answer,
+                                            trial_history[trialkey],
+                                            known_values,
+                                            tqdm_updater,
+                                            save_file+'.tmp')
+        # Update results (ALL trials)
+        with open(save_file, 'w') as f:
+            json.dump(trial_history, f, indent=1)
+    return trial_history
 
 if __name__ == '__main__':
-    """
-        Arguments for execution
-    """
+    ###########################################################################
+    #                       Command Line Interface                            #
+    ###########################################################################
+
     prs = argparse.ArgumentParser()
     prs.add_argument('file',
                      help="Path to log results to (in JSON format)")
@@ -717,6 +795,11 @@ if __name__ == '__main__':
                      default=None, nargs='*',
                      help="Prompt styles to use (default: ALL)")
     args = prs.parse_args()
+
+    ###########################################################################
+    #                       Command Line Parsing                              #
+    ###########################################################################
+
     if pathlib.Path(args.file).exists():
         raise ValueError(f"File '{args.file}' exists and would be overwritten!")
     LLM_MODEL = args.model
@@ -735,6 +818,7 @@ if __name__ == '__main__':
         args.token_limit = int(args.context_length * args.n_examples)
     else:
         args.n_examples = int(args.n_examples)
+        args.token_limit = None
     if args.icl_in_vocab is None:
         args.icl_in_vocab = ['None']
     if args.eval_in_vocab is None:
@@ -790,7 +874,7 @@ if __name__ == '__main__':
                     len(args.eval_in_vocab) * len(args.prompts)
     overall_progress = tqdm.tqdm(total=n_to_compute)
     # Cumulative results of program execution
-    results = dict()
+    results = {'configs': OLLAMA_CONFIGS}
     # Nest allllll the loops
     for (name, op, substitution) in zip(args.operators, used_op_calls, substitutions):
         # ... using itertools product
@@ -813,10 +897,9 @@ if __name__ == '__main__':
             if PROMPT_SETTING == 'icl':
                 bonus_kwargs = {}
             elif PROMPT_SETTING == 'system':
-                if name == 'special_operation':
-                    print("Skipping special_operation on system"
-                          " message only -- nothing of value "
-                          "to learn.")
+                if name in op_extensions.names:
+                    print("Skipping extended operator '{name}' on system "
+                          "message only -- nothing of value to learn.")
                     overall_progress.update(n=1)
                     continue
                 bonus_kwargs = {'with_context': False}
@@ -826,22 +909,21 @@ if __name__ == '__main__':
                 bonus_kwargs = {'no_prompt': True}
             else:
                 raise NotImplemented(PROMPT_SETTING)
-            result_wrapper(results,
-                            args.file,
-                            llm_examples,
-                            op,
-                            tqdm_updater=overall_progress,
-                            n_examples=args.n_examples,
-                            token_limit=args.token_limit,
-                            n_evals=args.n_evals,
-                            max_digits=N_DIGITS,
-                            strict_digits=STRICTNESS,
-                            include_negative=NEGATIVE,
-                            feature_expression=FEATURE_EXPRESSION,
-                            substitution_operand=substitution,
-                            encourage_rewrites=REWRITE,
-                            icl_in_vocab=ICL_IN_VOCAB,
-                            eval_in_vocab=EVAL_IN_VOCAB,
-                            **bonus_kwargs)
+            results = llm_examples(op,
+                                   results,
+                                   args.file,
+                                   tqdm_updater=overall_progress,
+                                   n_examples=args.n_examples,
+                                   token_limit=args.token_limit,
+                                   n_evals=args.n_evals,
+                                   max_digits=N_DIGITS,
+                                   strict_digits=STRICTNESS,
+                                   include_negative=NEGATIVE,
+                                   feature_expression=FEATURE_EXPRESSION,
+                                   substitution_operand=substitution,
+                                   encourage_rewrites=REWRITE,
+                                   icl_in_vocab=ICL_IN_VOCAB,
+                                   eval_in_vocab=EVAL_IN_VOCAB,
+                                   **bonus_kwargs)
     print(results)
 

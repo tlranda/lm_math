@@ -10,6 +10,11 @@ def bitshift_list(i_value, max_bits=None):
         n_values += 1
     return blist
 
+sign = '†'
+description = 'represents a special nonlinear operation that always returns '+\
+              'integer values. Do not attempt to explain what it does, only '+\
+              'provide your best guess of what the correct value for this '+\
+              'operation is given the provided inputs.'
 def special_operation(left,right):
     """
         A difficult function that an LLM will probably not have seen in its training data.
