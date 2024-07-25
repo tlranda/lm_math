@@ -733,6 +733,8 @@ if __name__ == '__main__':
     prs = argparse.ArgumentParser()
     prs.add_argument('file',
                      help="Path to log results to (in JSON format)")
+    prs.add_argument('--override', action='store_true',
+                     help="Expect to override the file, preventing safety errors")
     llmconf = prs.add_argument_group("Problem High-Level Settings")
     llmconf.add_argument("--n-examples", type=str, default=10,
                      help="Number of ICL examples for the LLM (prepend with "
@@ -800,7 +802,7 @@ if __name__ == '__main__':
     #                       Command Line Parsing                              #
     ###########################################################################
 
-    if pathlib.Path(args.file).exists():
+    if pathlib.Path(args.file).exists() and not args.override:
         raise ValueError(f"File '{args.file}' exists and would be overwritten!")
     LLM_MODEL = args.model
     if args.seeds is not None:
@@ -926,4 +928,8 @@ if __name__ == '__main__':
                                    eval_in_vocab=EVAL_IN_VOCAB,
                                    **bonus_kwargs)
     print(results)
+    # Clean up the .tmp file on successful exit
+    tmp_file= pathlib.Path(args.file+'.tmp')
+    if tmp_file.exists():
+        tmp_file.unlink()
 
